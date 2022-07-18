@@ -1,69 +1,80 @@
 package main
 
 import (
-	"bufio"
 	"fmt"
-	"log"
-	"net"
 	"os"
-	"strings"
+	"time"
+
+	portscanner "github.com/anvie/port-scanner"
+	"github.com/aws/aws-sdk-go/aws"
+	"github.com/aws/aws-sdk-go/aws/session"
+	"github.com/aws/aws-sdk-go/service/ec2"
 )
 
-func main() {
-
-	scanner := bufio.NewScanner(os.Stdin)
-	fmt.Printf("domain,hasMX,hasSPF,sprRecord,hasDMARC,dmarcRecord\n")
-
-	for scanner.Scan() {
-		checkDomain(scanner.Text())
-	}
-
-	if err := scanner.Err(); err != nil {
-		log.Fatal("Error: could not read from input: %v\n", err)
-	}
+type openPorts struct {
+	IP   string
+	PORT []int
 }
 
-func checkDomain(domain string) {
-
-	var hasMX, hasSPF, hasDMARC bool
-	var spfRecord, dmarcRecord string
-
-	mxRecords, err := net.LookupMX(domain)
-
-	if err != nil {
-		log.Printf("Error: %v\n", err)
+func main() {
+	open := []openPorts{}
+	for _, ip := range publicIPS() {
+		open = append(open, portScanner(ip))
 	}
+	fmt.Printf("%+v\n", open)
+}
 
-	if len(mxRecords) > 0 {
-		hasMX = true
+func publicIPS() []string {
+	listPublicAddress := []string{}
+	sess, _ := session.NewSession(&aws.Config{
+		Region: aws.String(os.Getenv("AWS_REGION"))},
+	)
+	svc := ec2.New(sess)
+	result, _ := svc.DescribeAddresses(&ec2.DescribeAddressesInput{
+		Filters: []*ec2.Filter{
+			{
+				Name:   aws.String("domain"),
+				Values: aws.StringSlice([]string{"vpc"}),
+			},
+		},
+	})
+	if len(result.Addresses) == 0 {
+		fmt.Printf("No elastic IPs for %s region\n", *svc.Config.Region)
+	} else {
+		for _, addr := range result.Addresses {
+			listPublicAddress = append(listPublicAddress, aws.StringValue(addr.PublicIp))
+		}
+		return listPublicAddress
 	}
+	return listPublicAddress
+}
 
-	txtRecords, err := net.LookupTXT(domain)
+// portScanner scan range 20-30000 through goroutines, opening a thread for each request
+func portScanner(ip string) openPorts {
 
-	if err != nil {
-		log.Printf("Error:%v\n", err)
-	}
+	// 22 -> SSH, 443 -> SSL, 80 -> HTTP, 1194 -> OPENVPN
+	allowedPorts := []int{22, 443, 80, 1194}
+	open := openPorts{}
 
-	for _, record := range txtRecords {
-		if strings.HasPrefix(record, "v=spf1") {
-			hasSPF = true
-			spfRecord = record
-			break
+	// 29980 threads := 1 thread = connection
+	openedPorts := portscanner.NewPortScanner(ip, 2*time.Second, 29980).GetOpenedPort(20, 30000)
+
+	for i := 0; i < len(openedPorts); i++ {
+		port := openedPorts[i]
+		if !(contains(allowedPorts, port)) {
+			open.IP = ip
+			open.PORT = append(open.PORT, port)
 		}
 	}
+	return open
+}
 
-	dmarcRecords, err := net.LookupTXT("_dmarc." + domain)
-	if err != nil {
-		log.Printf("ErrorL%v\n", err)
+// contains compares the array with the object
+func contains(slice []int, item int) bool {
+	set := make(map[int]struct{}, len(slice))
+	for _, s := range slice {
+		set[s] = struct{}{}
 	}
-
-	for _, record := range dmarcRecords {
-		if strings.HasPrefix(record, "v=DMARC1") {
-			hasDMARC = true
-			dmarcRecord = record
-			break
-		}
-	}
-
-	fmt.Printf("%v, %v, %v, %v, %v, %v", domain, hasMX, hasSPF, spfRecord, hasDMARC, dmarcRecord)
+	_, ok := set[item]
+	return ok
 }
